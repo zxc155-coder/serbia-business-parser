@@ -46,10 +46,14 @@ DEFAULT_USE_MAPS = os.environ.get("SERBIA_PARSER_USE_MAPS", "0") == "1"
 MAX_SEARCH = int(os.environ.get("SERBIA_PARSER_MAX_SEARCH", "20"))
 MAX_MAPS = int(os.environ.get("SERBIA_PARSER_MAX_MAPS", "15"))
 MAX_WEBSITES = int(os.environ.get("SERBIA_PARSER_MAX_WEBSITES", "120"))
-# Per-category targets. The bot's overall goal is ~500 valid contacts in ~20 min;
-# split across categories the user actually requested.
-TARGET_VALID = int(os.environ.get("SERBIA_PARSER_TARGET_VALID", "500"))
+# Default budget used only when /status is shown before a job starts.
+DEFAULT_TARGET_VALID = int(os.environ.get("SERBIA_PARSER_TARGET_VALID", "500"))
 DEADLINE_S = int(os.environ.get("SERBIA_PARSER_DEADLINE_S", "1200"))  # 20 min
+
+# Pre-parse count picker. The user explicitly chooses the target number of
+# valid contacts before the run starts; the value is split across the
+# selected categories at runtime.
+COUNT_OPTIONS = (50, 100, 200, 500, 1000, 2000)
 
 PROGRESS_EDIT_INTERVAL = 2.5  # seconds — avoid Telegram rate limits.
 
@@ -62,12 +66,12 @@ STAGE_LABEL = {
 }
 
 
-def _per_category_targets(n_categories: int) -> tuple[int, float]:
-    """Split the global TARGET_VALID / DEADLINE_S budget across N categories."""
+def _per_category_targets(target_total: int, n_categories: int) -> tuple[int, float]:
+    """Split the user-chosen target / global DEADLINE_S budget across N categories."""
     if n_categories <= 0:
-        return TARGET_VALID, float(DEADLINE_S)
+        return target_total, float(DEADLINE_S)
     return (
-        max(50, TARGET_VALID // n_categories),
+        max(10, target_total // n_categories),
         max(60.0, DEADLINE_S / n_categories),
     )
 
@@ -77,6 +81,7 @@ class Job:
     chat_id: int
     user_id: int
     category_keys: list[str]
+    target_total: int = DEFAULT_TARGET_VALID
     cancel_event: threading.Event = field(default_factory=threading.Event)
     progress_msg_id: int | None = None
     last_edit_at: float = 0.0
@@ -89,13 +94,25 @@ def _categories_keyboard() -> InlineKeyboardMarkup:
     rows = []
     row = []
     for i, c in enumerate(CATEGORIES, 1):
-        row.append(InlineKeyboardButton(f"{i}. {c.title_sr}", callback_data=f"parse:{c.key}"))
+        row.append(InlineKeyboardButton(f"{i}. {c.title_sr}", callback_data=f"parse:cat:{c.key}"))
         if len(row) == 1:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("⏩ Все 10", callback_data="parse:__all__")])
+    rows.append([InlineKeyboardButton("⏩ Все 10", callback_data="parse:cat:__all__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _count_keyboard(cat_key: str) -> InlineKeyboardMarkup:
+    """Inline keyboard for picking the target number of valid contacts."""
+    buttons = [
+        InlineKeyboardButton(str(n), callback_data=f"parse:cnt:{cat_key}:{n}")
+        for n in COUNT_OPTIONS
+    ]
+    # Three buttons per row.
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("« Назад к категориям", callback_data="parse:cat:__menu__")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -176,14 +193,22 @@ class BotApp:
             return
         key = ctx.args[0]
         try:
-            by_key(key)
+            cat = by_key(key)
         except KeyError:
             await update.message.reply_text(f"Неизвестная категория: {key}")
             return
-        await self._launch(update, ctx, [key])
+        await update.message.reply_text(
+            f"<b>{cat.title_sr}</b>\nСколько валидных контактов нужно найти?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_count_keyboard(key),
+        )
 
     async def cmd_parse_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._launch(update, ctx, [c.key for c in CATEGORIES])
+        await update.message.reply_text(
+            "<b>Все 10 категорий</b>\nСколько валидных контактов нужно найти суммарно?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_count_keyboard("__all__"),
+        )
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         job = self._jobs.get(update.effective_user.id)
@@ -203,45 +228,63 @@ class BotApp:
     async def on_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         await q.answer()
-        if not q.data or not q.data.startswith("parse:"):
+        if not q.data:
             return
-        key = q.data.split(":", 1)[1]
-        if key == "__all__":
-            keys = [c.key for c in CATEGORIES]
-        else:
-            try:
-                by_key(key)
-            except KeyError:
-                await q.message.reply_text(f"Неизвестная категория: {key}")
+        parts = q.data.split(":")
+        # Backward compat: old "parse:<key>" → treat as category pick.
+        if len(parts) == 2 and parts[0] == "parse":
+            parts = ["parse", "cat", parts[1]]
+        if len(parts) < 3 or parts[0] != "parse":
+            return
+        action = parts[1]
+        if action == "cat":
+            cat_key = parts[2]
+            if cat_key == "__menu__":
+                await q.message.reply_text("Категории:", reply_markup=_categories_keyboard())
                 return
-            keys = [key]
-        await self._launch_from_query(update, ctx, keys)
+            title = "Все 10 категорий" if cat_key == "__all__" else by_key(cat_key).title_sr
+            suffix = "" if cat_key == "__all__" else ""
+            text = (
+                f"<b>{title}</b>\nСколько валидных контактов нужно найти"
+                f"{' суммарно' if cat_key == '__all__' else ''}?{suffix}"
+            )
+            await q.message.reply_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=_count_keyboard(cat_key)
+            )
+            return
+        if action == "cnt":
+            if len(parts) < 4:
+                return
+            cat_key = parts[2]
+            try:
+                target_total = int(parts[3])
+            except ValueError:
+                return
+            if cat_key == "__all__":
+                keys = [c.key for c in CATEGORIES]
+            else:
+                try:
+                    by_key(cat_key)
+                except KeyError:
+                    await q.message.reply_text(f"Неизвестная категория: {cat_key}")
+                    return
+                keys = [cat_key]
+            await self._launch_from_query(update, ctx, keys, target_total)
 
     # ----- core launch ------------------------------------------------------
-
-    async def _launch(
-        self,
-        update: Update,
-        ctx: ContextTypes.DEFAULT_TYPE,
-        keys: list[str],
-    ) -> None:
-        await self._do_launch(
-            chat_id=update.effective_chat.id,
-            user_id=update.effective_user.id,
-            keys=keys,
-            ctx=ctx,
-        )
 
     async def _launch_from_query(
         self,
         update: Update,
         ctx: ContextTypes.DEFAULT_TYPE,
         keys: list[str],
+        target_total: int,
     ) -> None:
         await self._do_launch(
             chat_id=update.effective_chat.id,
             user_id=update.effective_user.id,
             keys=keys,
+            target_total=target_total,
             ctx=ctx,
         )
 
@@ -250,6 +293,7 @@ class BotApp:
         chat_id: int,
         user_id: int,
         keys: list[str],
+        target_total: int,
         ctx: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         async with self._jobs_lock:
@@ -263,13 +307,14 @@ class BotApp:
                 chat_id=chat_id,
                 user_id=user_id,
                 category_keys=keys,
+                target_total=target_total,
             )
             self._jobs[user_id] = job
 
         # Initial progress message we will edit.
         msg = await ctx.bot.send_message(
             chat_id,
-            f"Стартую парсинг ({len(keys)} категорий)…",
+            f"Стартую парсинг ({len(keys)} категорий, цель {target_total} валидных)…",
             parse_mode=ParseMode.HTML,
         )
         job.progress_msg_id = msg.message_id
@@ -290,7 +335,9 @@ class BotApp:
             asyncio.run_coroutine_threadsafe(self._safe_edit_progress(job, ctx), loop)
 
         try:
-            target_valid, deadline_s = _per_category_targets(len(job.category_keys))
+            target_valid, deadline_s = _per_category_targets(
+                job.target_total, len(job.category_keys)
+            )
             for idx, key in enumerate(job.category_keys):
                 job.current_index = idx
                 cat = by_key(key)
@@ -309,19 +356,26 @@ class BotApp:
                     cancel_event=job.cancel_event,
                 )
 
-                # Send CSV.
-                row_count, valid_count = _count_rows_and_valid(out_path)
-                await ctx.bot.send_document(
-                    job.chat_id,
-                    document=out_path.open("rb"),
-                    filename=out_path.name,
-                    caption=(
-                        f"<b>{cat.title_sr}</b>\n"
-                        f"Строк: {row_count} (валидных: {valid_count})\n"
-                        f"Файл: <code>{out_path.name}</code>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
+                # Send CSV (already filtered to valid records on disk).
+                row_count = _count_rows(out_path)
+                if row_count == 0:
+                    await ctx.bot.send_message(
+                        job.chat_id,
+                        f"<b>{cat.title_sr}</b>\nНи одной валидной записи не нашлось — файл не отправляю.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await ctx.bot.send_document(
+                        job.chat_id,
+                        document=out_path.open("rb"),
+                        filename=out_path.name,
+                        caption=(
+                            f"<b>{cat.title_sr}</b>\n"
+                            f"Валидных записей: {row_count}\n"
+                            f"Файл: <code>{out_path.name}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
                 if job.cancel_event.is_set():
                     break
             await ctx.bot.send_message(
@@ -356,21 +410,19 @@ class BotApp:
         self.app.run_polling(drop_pending_updates=True)
 
 
-def _count_rows_and_valid(path: Path) -> tuple[int, int]:
-    """Return (total_rows, valid_rows) for a category CSV.
-
-    A row is valid when its phone or email column is non-empty.
-    """
+def _count_rows(path: Path) -> int:
+    """Return the number of data rows in a CSV (excluding the header line)."""
     if not path.exists():
-        return 0, 0
-    total = 0
-    valid = 0
+        return 0
+    n = 0
     with path.open("r", encoding="utf-8", newline="") as f:
-        for row in csv.DictReader(f):
-            total += 1
-            if (row.get("phone") or "").strip() or (row.get("email") or "").strip():
-                valid += 1
-    return total, valid
+        reader = csv.reader(f)
+        for i, row in enumerate(reader):
+            if i == 0:
+                continue  # skip header
+            if any(cell.strip() for cell in row):
+                n += 1
+    return n
 
 
 def main() -> int:

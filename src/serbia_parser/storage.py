@@ -16,7 +16,6 @@ FIELDS = (
     "city",
     "social",
     "description",
-    "verified_whatsapp",
     "source",
     "source_url",
 )

@@ -30,26 +30,6 @@
 
 Все записи дедуплицируются по домену → телефону → имени.
 
-## WhatsApp-верификация (опционально)
-
-После парсинга бот может прогнать собранные телефоны через web.whatsapp.com и
-отметить в CSV столбце `verified_whatsapp` одно из значений:
-
-| значение | смысл |
-|----------|-------|
-| `yes` | номер зарегистрирован в WhatsApp |
-| `no` | номер не найден в WhatsApp |
-| `unknown` | таймаут / WhatsApp не ответил уверенно |
-| *(пусто)* | проверка не запускалась или нет нормализованного номера |
-
-**Как это работает**: headless Chrome открывает `web.whatsapp.com/send?phone=…`
-под залогиненной сессией. Сессия хранится в персистентном Chrome-профиле
-(по умолчанию `~/.serbia_parser/wa_profile`), так что вход через QR
-сканируется **один раз**.
-
-> ⚠️ WhatsApp банит за массовую проверку с основных аккаунтов. Используйте
-> технический номер. Реалистичная скорость — ~3–6 с/номер.
-
 ## Установка
 
 ```bash
@@ -85,6 +65,10 @@ PYTHONPATH=src python3 -m serbia_parser.cli \
 Результат: `data/<category_key>.csv` со столбцами
 `category, company, website, phone, email, address, city, social, description, source, source_url`.
 
+Проверку телефонов в WhatsApp бот не делает — это надёжнее и быстрее
+делать локальными инструментами (whatcheck / Lyzem / собственный скрипт)
+на готовом CSV.
+
 ## Telegram-бот
 
 ### Создание бота
@@ -114,13 +98,9 @@ PYTHONPATH=src python3 -m serbia_parser.bot
 | `/start`, `/help` | приветствие + меню категорий с кнопками |
 | `/categories` | inline-клавиатура со всеми 10 категориями |
 | `/parse <ключ>` | спарсить одну категорию, в конце вернёт CSV |
-| `/parse <ключ> verify` | спарсить + сразу проверить все телефоны в WhatsApp |
 | `/parse_all` | спарсить все 10 категорий по очереди |
 | `/status` | прогресс текущей задачи |
 | `/cancel` | отменить текущую задачу |
-| `/wa_login` | прислать QR-код для входа в WhatsApp Web (один раз) |
-| `/wa_status` | проверить, активна ли WhatsApp-сессия |
-| `/verify` | прислать CSV в чат — бот вернёт его же со столбцом `verified_whatsapp` |
 
 Во время работы бот редактирует одно сообщение и обновляет в нём прогресс-бар,
 этап (поиск / каталог / Maps / краулинг сайтов) и количество найденных компаний.
@@ -144,23 +124,22 @@ ruff check .
 
 ```
 src/serbia_parser/
-├── bot.py                 # python-telegram-bot обёртка + WA-команды
+├── bot.py                 # python-telegram-bot обёртка
 ├── categories.py          # 10 категорий + расширенные ключевые слова + города
 ├── cli.py                 # CLI-точка входа
 ├── crawler.py             # обход найденного сайта на контактах
 ├── dedup.py               # дедуп по домену/телефону/имени
-├── driver.py              # headless Selenium (Chrome) для Maps / WA
+├── driver.py              # headless Selenium (Chrome) для Maps
 ├── extractor.py           # извлечение email/phone/address из HTML
 ├── http.py                # общий requests.Session с задержками/ретраями
 ├── pipeline.py            # parallel search → directory → maps → crawl → dedup → save
-├── storage.py             # CSV-вывод (+ verified_whatsapp)
+├── storage.py             # CSV-вывод
 └── sources/
     ├── bing.py
     ├── companywall.py
     ├── duckduckgo.py
     ├── maps.py
-    ├── privredni_imenik.py # B2B-каталог privredni-imenik.com
-    └── whatsapp.py        # headless WhatsApp Web verifier (QR + persistent profile)
+    └── privredni_imenik.py # B2B-каталог privredni-imenik.com
 ```
 
 ## Ограничения и заметки

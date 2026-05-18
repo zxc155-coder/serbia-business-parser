@@ -1,0 +1,44 @@
+# Render service definition for the Serbia B2B parser Telegram bot.
+#
+# Render's free tier idles a Web Service when no inbound HTTP request hits it
+# for ~15 min. The bot uses long polling and would normally never receive
+# inbound traffic, so it bundles a tiny keep-alive HTTP server (see
+# `src/serbia_parser/keep_alive.py`) that answers `/` and `/health` with 200.
+#
+# Point an external pinger (cron-job.org / UptimeRobot / Pingdom) at
+# `https://<your-render-app>.onrender.com/health` every 5–10 minutes to keep
+# the worker warm.
+#
+# To deploy:
+#   1. Sign in to Render and create a new Blueprint pointed at this repo.
+#   2. Set the `TELEGRAM_BOT_TOKEN` secret in the service dashboard.
+#   3. After the first deploy, copy the service URL and configure your
+#      preferred uptime pinger to GET `.../health` every 5 minutes.
+services:
+  - type: web
+    name: serbia-business-parser-bot
+    runtime: python
+    region: frankfurt
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python -m serbia_parser.bot
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: PYTHONPATH
+        value: src
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SERBIA_PARSER_USE_MAPS
+        value: "0"
+      - key: SERBIA_PARSER_TARGET_VALID
+        value: "500"
+      - key: SERBIA_PARSER_DEADLINE_S
+        value: "1200"
+      - key: SERBIA_PARSER_MAX_WEBSITES
+        value: "120"
+      - key: SERBIA_PARSER_DATA
+        value: /tmp/data

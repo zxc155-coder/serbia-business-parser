@@ -17,6 +17,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import csv
 import logging
 import os
 import threading
@@ -34,6 +35,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from . import keep_alive
 from .categories import CATEGORIES, by_key
 from .pipeline import Cancelled, Progress, run_category
 
@@ -41,9 +43,13 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("SERBIA_PARSER_DATA", "data")).resolve()
 DEFAULT_USE_MAPS = os.environ.get("SERBIA_PARSER_USE_MAPS", "0") == "1"
-MAX_SEARCH = int(os.environ.get("SERBIA_PARSER_MAX_SEARCH", "15"))
+MAX_SEARCH = int(os.environ.get("SERBIA_PARSER_MAX_SEARCH", "20"))
 MAX_MAPS = int(os.environ.get("SERBIA_PARSER_MAX_MAPS", "15"))
-MAX_WEBSITES = int(os.environ.get("SERBIA_PARSER_MAX_WEBSITES", "40"))
+MAX_WEBSITES = int(os.environ.get("SERBIA_PARSER_MAX_WEBSITES", "120"))
+# Per-category targets. The bot's overall goal is ~500 valid contacts in ~20 min;
+# split across categories the user actually requested.
+TARGET_VALID = int(os.environ.get("SERBIA_PARSER_TARGET_VALID", "500"))
+DEADLINE_S = int(os.environ.get("SERBIA_PARSER_DEADLINE_S", "1200"))  # 20 min
 
 PROGRESS_EDIT_INTERVAL = 2.5  # seconds — avoid Telegram rate limits.
 
@@ -54,6 +60,16 @@ STAGE_LABEL = {
     "crawl": "Краулинг сайтов",
     "done": "Готово",
 }
+
+
+def _per_category_targets(n_categories: int) -> tuple[int, float]:
+    """Split the global TARGET_VALID / DEADLINE_S budget across N categories."""
+    if n_categories <= 0:
+        return TARGET_VALID, float(DEADLINE_S)
+    return (
+        max(50, TARGET_VALID // n_categories),
+        max(60.0, DEADLINE_S / n_categories),
+    )
 
 
 @dataclass
@@ -101,7 +117,7 @@ def _format_progress(job: Job) -> str:
         f"{header}"
         f"Этап: <b>{stage}</b>\n"
         f"<code>{bar}</code> {p.current}/{p.total} ({pct:.0f}%)\n"
-        f"Найдено компаний: <b>{p.found}</b>\n"
+        f"Найдено компаний: <b>{p.found}</b> (валидных: <b>{p.valid}</b>)\n"
         f"Время: {elapsed}s\n"
         f"<i>{(p.detail or '')[:120]}</i>"
     )
@@ -274,6 +290,7 @@ class BotApp:
             asyncio.run_coroutine_threadsafe(self._safe_edit_progress(job, ctx), loop)
 
         try:
+            target_valid, deadline_s = _per_category_targets(len(job.category_keys))
             for idx, key in enumerate(job.category_keys):
                 job.current_index = idx
                 cat = by_key(key)
@@ -286,18 +303,22 @@ class BotApp:
                     max_search_results=MAX_SEARCH,
                     max_maps_results=MAX_MAPS,
                     max_websites=MAX_WEBSITES,
+                    target_valid=target_valid,
+                    deadline_s=deadline_s,
                     on_progress=on_progress,
                     cancel_event=job.cancel_event,
                 )
 
                 # Send CSV.
-                row_count = _count_rows(out_path)
+                row_count, valid_count = _count_rows_and_valid(out_path)
                 await ctx.bot.send_document(
                     job.chat_id,
                     document=out_path.open("rb"),
                     filename=out_path.name,
                     caption=(
-                        f"<b>{cat.title_sr}</b>\nСтрок: {row_count}\nФайл: <code>{out_path.name}</code>"
+                        f"<b>{cat.title_sr}</b>\n"
+                        f"Строк: {row_count} (валидных: {valid_count})\n"
+                        f"Файл: <code>{out_path.name}</code>"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -335,12 +356,21 @@ class BotApp:
         self.app.run_polling(drop_pending_updates=True)
 
 
-def _count_rows(path: Path) -> int:
+def _count_rows_and_valid(path: Path) -> tuple[int, int]:
+    """Return (total_rows, valid_rows) for a category CSV.
+
+    A row is valid when its phone or email column is non-empty.
+    """
     if not path.exists():
-        return 0
-    with path.open("r", encoding="utf-8") as f:
-        # subtract header
-        return max(0, sum(1 for _ in f) - 1)
+        return 0, 0
+    total = 0
+    valid = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            total += 1
+            if (row.get("phone") or "").strip() or (row.get("email") or "").strip():
+                valid += 1
+    return total, valid
 
 
 def main() -> int:
@@ -357,6 +387,15 @@ def main() -> int:
         )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Keep-alive HTTP server for Render (and any other host that idles
+    # long-polling workers without inbound traffic).
+    if os.environ.get("SERBIA_PARSER_DISABLE_KEEPALIVE", "0") != "1":
+        try:
+            keep_alive.start()
+        except OSError as e:
+            log.warning("keep_alive server failed to start: %s", e)
+
     BotApp(token).run()
     return 0
 

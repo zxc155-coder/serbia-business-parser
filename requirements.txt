@@ -5,3 +5,4 @@ tldextract>=5.1
 selenium>=4.20
 webdriver-manager>=4.0
 python-dotenv>=1.0
+python-telegram-bot>=21.0

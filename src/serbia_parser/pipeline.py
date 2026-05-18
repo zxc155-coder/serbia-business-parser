@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,9 +19,13 @@ from .crawler import crawl_site
 from .dedup import dedup_records
 from .extractor import base_domain
 from .http import HTTP
-from .sources import bing, companywall, duckduckgo
+from .sources import bing, companywall, duckduckgo, privredni_imenik
 from .sources import maps as maps_src
 from .storage import write_csv
+
+# Concurrency: how many websites we crawl in parallel. requests.Session is
+# thread-safe for read-only GETs with our usage, so this is fine.
+CRAWL_WORKERS = 6
 
 log = logging.getLogger(__name__)
 
@@ -120,20 +125,55 @@ def run_category(
             log.warning("Bing error for %r: %s", kw, e)
     log.info("search hits: %s", len(search_hits))
 
-    # --- 2. companywall.rs directory lookups. -------------------------------
+    # --- 2. Directory lookups (companywall.rs + privredni-imenik.com). ------
     cw_hits: list[dict[str, str]] = []
-    cw_keywords = category.keywords_sr[:3]
-    for i, kw in enumerate(cw_keywords, 1):
+    pi_hits: list[dict[str, str]] = []
+    # Keep first few SR keywords (most relevant) for directory searches.
+    dir_keywords = list(category.keywords_sr[:4])
+    total_dir_steps = len(dir_keywords) * 2  # 2 directories
+    step = 0
+    for kw in dir_keywords:
         _check_cancel(cancel_event)
+        step += 1
         _emit(
             on_progress,
-            Progress(category.key, "directory", i, len(cw_keywords), len(cw_hits), kw),
+            Progress(
+                category.key,
+                "directory",
+                step,
+                total_dir_steps,
+                len(cw_hits) + len(pi_hits),
+                f"companywall: {kw}",
+            ),
         )
         try:
             cw_hits.extend(companywall.search(http, kw, max_results=20))
         except Exception as e:
             log.warning("companywall search error for %r: %s", kw, e)
-    log.info("companywall hits: %s", len(cw_hits))
+
+        _check_cancel(cancel_event)
+        step += 1
+        _emit(
+            on_progress,
+            Progress(
+                category.key,
+                "directory",
+                step,
+                total_dir_steps,
+                len(cw_hits) + len(pi_hits),
+                f"privredni-imenik: {kw}",
+            ),
+        )
+        try:
+            pi_hits.extend(privredni_imenik.search(http, kw, max_results=40))
+        except Exception as e:
+            log.warning("privredni_imenik search error for %r: %s", kw, e)
+    # Deduplicate directory hits by url.
+    cw_seen: set[str] = set()
+    cw_hits = [h for h in cw_hits if h["url"] not in cw_seen and not cw_seen.add(h["url"])]
+    pi_seen: set[str] = set()
+    pi_hits = [h for h in pi_hits if h["url"] not in pi_seen and not pi_seen.add(h["url"])]
+    log.info("companywall hits: %s, privredni_imenik hits: %s", len(cw_hits), len(pi_hits))
 
     # --- 3. Maps lookups (city × category query). ---------------------------
     maps_hits: list[dict[str, str]] = []
@@ -180,55 +220,71 @@ def run_category(
         if max_websites and len(websites_to_crawl) >= max_websites:
             break
 
-    log.info("crawling %s unique websites", len(websites_to_crawl))
-    for i, (homepage, hit) in enumerate(websites_to_crawl, 1):
-        _check_cancel(cancel_event)
-        _emit(
-            on_progress,
-            Progress(
-                category.key,
-                "crawl",
-                i,
-                len(websites_to_crawl),
-                len(records),
-                homepage,
-            ),
-        )
-        info = crawl_site(http, homepage)
-        if not info.is_useful():
-            continue
-        records.append(
-            {
-                "category": category.title_ru,
-                "company": info.title or hit.get("title", "")[:200],
-                "website": homepage,
-                "phone": "; ".join(info.phones[:3]),
-                "email": "; ".join(info.emails[:3]),
-                "address": info.addresses[0] if info.addresses else "",
-                "city": _guess_city(info.addresses),
-                "social": "; ".join(info.socials[:5]),
-                "description": info.description or hit.get("snippet", ""),
-                "source": hit["source"],
-                "source_url": hit["url"],
-            }
-        )
+    log.info("crawling %s unique websites in parallel", len(websites_to_crawl))
 
-    for i, cw in enumerate(cw_hits, 1):
-        _check_cancel(cancel_event)
-        _emit(
-            on_progress,
-            Progress(category.key, "directory", i, len(cw_hits), len(records), cw["title"]),
-        )
-        profile = companywall.fetch_profile(http, cw["url"])
-        if not profile and not cw.get("title"):
-            continue
-        website = profile.get("website", "")
-        address = profile.get("address", "")
-        records.append(
-            {
+    def _crawl_one(args: tuple[str, dict]) -> dict | None:
+        homepage, hit = args
+        try:
+            info = crawl_site(http, homepage)
+        except Exception as e:  # crawler must never crash the executor
+            log.warning("crawl failed for %s: %s", homepage, e)
+            return None
+        if not info.is_useful():
+            return None
+        return {
+            "category": category.title_ru,
+            "company": info.title or hit.get("title", "")[:200],
+            "website": homepage,
+            "phone": "; ".join(info.phones[:3]),
+            "email": "; ".join(info.emails[:3]),
+            "address": info.addresses[0] if info.addresses else "",
+            "city": _guess_city(info.addresses),
+            "social": "; ".join(info.socials[:5]),
+            "description": info.description or hit.get("snippet", ""),
+            "source": hit["source"],
+            "source_url": hit["url"],
+        }
+
+    if websites_to_crawl:
+        done = 0
+        total = len(websites_to_crawl)
+        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+            futures = {ex.submit(_crawl_one, args): args for args in websites_to_crawl}
+            try:
+                for fut in as_completed(futures):
+                    _check_cancel(cancel_event)
+                    done += 1
+                    args = futures[fut]
+                    rec = fut.result()
+                    if rec is not None:
+                        records.append(rec)
+                    _emit(
+                        on_progress,
+                        Progress(category.key, "crawl", done, total, len(records), args[0]),
+                    )
+            except Cancelled:
+                for f in futures:
+                    f.cancel()
+                raise
+
+    # companywall.rs profiles -- fetch in parallel and emit progress per result.
+    if cw_hits:
+        done = 0
+        total = len(cw_hits)
+
+        def _cw_one(cw: dict[str, str]) -> dict | None:
+            try:
+                profile = companywall.fetch_profile(http, cw["url"])
+            except Exception as e:
+                log.warning("companywall profile error for %s: %s", cw["url"], e)
+                return None
+            if not profile and not cw.get("title"):
+                return None
+            address = profile.get("address", "")
+            return {
                 "category": category.title_ru,
                 "company": cw["title"],
-                "website": website,
+                "website": profile.get("website", ""),
                 "phone": profile.get("phone", ""),
                 "email": profile.get("email", ""),
                 "address": address,
@@ -238,7 +294,85 @@ def run_category(
                 "source": "companywall",
                 "source_url": cw["url"],
             }
-        )
+
+        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+            futures = {ex.submit(_cw_one, cw): cw for cw in cw_hits}
+            try:
+                for fut in as_completed(futures):
+                    _check_cancel(cancel_event)
+                    done += 1
+                    rec = fut.result()
+                    if rec is not None:
+                        records.append(rec)
+                    _emit(
+                        on_progress,
+                        Progress(
+                            category.key,
+                            "directory",
+                            done,
+                            total,
+                            len(records),
+                            futures[fut].get("title", ""),
+                        ),
+                    )
+            except Cancelled:
+                for f in futures:
+                    f.cancel()
+                raise
+
+    # privredni-imenik.com profiles -- fetch in parallel.
+    if pi_hits:
+        done = 0
+        total = len(pi_hits)
+
+        def _pi_one(pi: dict[str, str]) -> dict | None:
+            try:
+                profile = privredni_imenik.fetch_profile(http, pi["url"])
+            except Exception as e:
+                log.warning("privredni_imenik profile error for %s: %s", pi["url"], e)
+                return None
+            if not profile and not pi.get("title"):
+                return None
+            address = profile.get("address", "")
+            company = profile.get("name") or pi.get("title", "")
+            return {
+                "category": category.title_ru,
+                "company": company,
+                "website": profile.get("website", ""),
+                "phone": profile.get("phone", ""),
+                "email": profile.get("email", ""),
+                "address": address,
+                "city": _guess_city([address] if address else []),
+                "social": "",
+                "description": profile.get("activity", ""),
+                "source": "privredni_imenik",
+                "source_url": pi["url"],
+            }
+
+        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+            futures = {ex.submit(_pi_one, pi): pi for pi in pi_hits}
+            try:
+                for fut in as_completed(futures):
+                    _check_cancel(cancel_event)
+                    done += 1
+                    rec = fut.result()
+                    if rec is not None:
+                        records.append(rec)
+                    _emit(
+                        on_progress,
+                        Progress(
+                            category.key,
+                            "directory",
+                            done,
+                            total,
+                            len(records),
+                            futures[fut].get("title", ""),
+                        ),
+                    )
+            except Cancelled:
+                for f in futures:
+                    f.cancel()
+                raise
 
     for mh in maps_hits:
         website = mh.get("website", "")

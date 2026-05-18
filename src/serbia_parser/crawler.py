@@ -2,6 +2,10 @@
 
 Given a homepage URL, fetch the home page plus a handful of likely contact pages
 (/kontakt, /contact, /o-nama, …) and aggregate emails / phones / addresses.
+
+Contact pages are visited first because they are several times more likely than
+the home page to yield a phone + email pair; we stop as soon as we have one of
+each so a typical site costs 1–2 HTTP requests instead of 6.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from .http import HTTP
 log = logging.getLogger(__name__)
 
 
-def crawl_site(http: HTTP, start_url: str, max_pages: int = 6) -> ContactInfo:
+def crawl_site(http: HTTP, start_url: str, max_pages: int = 4) -> ContactInfo:
     info = ContactInfo()
     if not start_url:
         return info
@@ -29,18 +33,22 @@ def crawl_site(http: HTTP, start_url: str, max_pages: int = 6) -> ContactInfo:
         return info
 
     visited: set[str] = set()
-    queue: list[str] = [start_url]
+
+    # Visit contact-style paths first — much higher yield than the homepage.
+    contact_urls = candidate_contact_urls(start_url)
+    discovered_from_home: list[str] = []
 
     home_resp = http.get(start_url, allow_redirects=True)
-    if home_resp is None or home_resp.status_code >= 400:
-        # Site might still be reachable on its contact paths even if home 4xx'd.
-        pass
-    else:
+    if home_resp is not None and home_resp.status_code < 400:
         visited.add(start_url)
         info.merge(extract_from_html(home_resp.text, base_url=home_resp.url))
-        queue.extend(_extract_contact_links(home_resp.text, home_resp.url))
+        discovered_from_home = _extract_contact_links(home_resp.text, home_resp.url)
 
-    queue.extend(candidate_contact_urls(start_url))
+    queue: list[str] = []
+    # Prioritise contact paths that the home page actually linked to (real
+    # routes) over the generic /kontakt /contact /o-nama guesses.
+    queue.extend(discovered_from_home)
+    queue.extend(contact_urls)
 
     for url in queue:
         if len(visited) >= max_pages:
@@ -52,7 +60,7 @@ def crawl_site(http: HTTP, start_url: str, max_pages: int = 6) -> ContactInfo:
         if resp is None or resp.status_code >= 400:
             continue
         info.merge(extract_from_html(resp.text, base_url=resp.url))
-        if info.is_useful() and len(info.emails) + len(info.phones) >= 2:
+        if info.phones and info.emails:
             break
 
     return info
@@ -86,4 +94,4 @@ def _extract_contact_links(html: str, base_url: str) -> list[str]:
         if u not in seen:
             seen.add(u)
             uniq.append(u)
-    return uniq[:8]
+    return uniq[:6]

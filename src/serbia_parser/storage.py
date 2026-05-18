@@ -6,9 +6,10 @@ not the code). Internal record dicts continue to key by the English
 identifiers below; the writer maps those to the Russian headers when
 emitting rows.
 
-By default only "valid" records — those with at least a phone or email —
-are written to disk, because the user has explicitly asked for files
-that contain only contactable companies.
+The user has explicitly asked the file to only contain companies that
+have a phone number, and to only show the company name, email, and
+phone columns — so by default `write_csv` filters records to those
+with a phone and emits only those three columns.
 """
 
 from __future__ import annotations
@@ -17,40 +18,29 @@ import csv
 from collections.abc import Iterable
 from pathlib import Path
 
-# Internal record keys (used everywhere in code).
+# Internal record keys (used everywhere in code). The pipeline still
+# builds rich dicts; the CSV writer only emits a subset of these columns.
 FIELDS = (
-    "category",
     "company",
-    "website",
-    "phone",
     "email",
-    "address",
-    "city",
-    "social",
-    "description",
-    "source",
-    "source_url",
+    "phone",
 )
 
 # Russian column headers — only used at CSV write time.
 HEADERS_RU = {
-    "category": "категория",
     "company": "компания",
-    "website": "сайт",
-    "phone": "телефон",
     "email": "email",
-    "address": "адрес",
-    "city": "город",
-    "social": "соцсети",
-    "description": "описание",
-    "source": "источник",
-    "source_url": "ссылка",
+    "phone": "телефон",
 }
 
 
 def is_valid_record(row: dict) -> bool:
-    """A record is exportable when it has at least a phone or an email."""
-    return bool((row.get("phone") or "").strip() or (row.get("email") or "").strip())
+    """A record is exportable when it has a phone number.
+
+    The user has asked the bot to ignore companies without a phone, so
+    email-only records are intentionally dropped here as well.
+    """
+    return bool((row.get("phone") or "").strip())
 
 
 def write_csv(

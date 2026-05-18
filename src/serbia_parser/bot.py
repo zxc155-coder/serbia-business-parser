@@ -94,7 +94,7 @@ def _categories_keyboard() -> InlineKeyboardMarkup:
     rows = []
     row = []
     for i, c in enumerate(CATEGORIES, 1):
-        row.append(InlineKeyboardButton(f"{i}. {c.title_sr}", callback_data=f"parse:cat:{c.key}"))
+        row.append(InlineKeyboardButton(f"{i}. {c.title_ru}", callback_data=f"parse:cat:{c.key}"))
         if len(row) == 1:
             rows.append(row)
             row = []
@@ -187,7 +187,7 @@ class BotApp:
             await update.message.reply_text(
                 "Использование: <code>/parse &lt;key&gt;</code>\n\n"
                 "Доступные ключи:\n"
-                + "\n".join(f"• <code>{c.key}</code> — {c.title_sr}" for c in CATEGORIES),
+                + "\n".join(f"• <code>{c.key}</code> — {c.title_ru}" for c in CATEGORIES),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -198,14 +198,14 @@ class BotApp:
             await update.message.reply_text(f"Неизвестная категория: {key}")
             return
         await update.message.reply_text(
-            f"<b>{cat.title_sr}</b>\nСколько валидных контактов нужно найти?",
+            f"<b>{cat.title_ru}</b>\nСколько компаний с телефоном нужно найти?",
             parse_mode=ParseMode.HTML,
             reply_markup=_count_keyboard(key),
         )
 
     async def cmd_parse_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
-            "<b>Все 10 категорий</b>\nСколько валидных контактов нужно найти суммарно?",
+            "<b>Все 10 категорий</b>\nСколько компаний с телефоном нужно найти суммарно?",
             parse_mode=ParseMode.HTML,
             reply_markup=_count_keyboard("__all__"),
         )
@@ -242,11 +242,10 @@ class BotApp:
             if cat_key == "__menu__":
                 await q.message.reply_text("Категории:", reply_markup=_categories_keyboard())
                 return
-            title = "Все 10 категорий" if cat_key == "__all__" else by_key(cat_key).title_sr
-            suffix = "" if cat_key == "__all__" else ""
+            title = "Все 10 категорий" if cat_key == "__all__" else by_key(cat_key).title_ru
             text = (
-                f"<b>{title}</b>\nСколько валидных контактов нужно найти"
-                f"{' суммарно' if cat_key == '__all__' else ''}?{suffix}"
+                f"<b>{title}</b>\nСколько компаний с телефоном нужно найти"
+                f"{' суммарно' if cat_key == '__all__' else ''}?"
             )
             await q.message.reply_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=_count_keyboard(cat_key)
@@ -361,7 +360,7 @@ class BotApp:
                 if row_count == 0:
                     await ctx.bot.send_message(
                         job.chat_id,
-                        f"<b>{cat.title_sr}</b>\nНи одной валидной записи не нашлось — файл не отправляю.",
+                        f"<b>{cat.title_ru}</b>\nНи одной компании с телефоном не нашлось — файл не отправляю.",
                         parse_mode=ParseMode.HTML,
                     )
                 else:
@@ -370,8 +369,8 @@ class BotApp:
                         document=out_path.open("rb"),
                         filename=out_path.name,
                         caption=(
-                            f"<b>{cat.title_sr}</b>\n"
-                            f"Валидных записей: {row_count}\n"
+                            f"<b>{cat.title_ru}</b>\n"
+                            f"Компаний с телефоном: {row_count}\n"
                             f"Файл: <code>{out_path.name}</code>"
                         ),
                         parse_mode=ParseMode.HTML,

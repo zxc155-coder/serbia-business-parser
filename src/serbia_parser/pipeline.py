@@ -102,8 +102,13 @@ def _check_cancel(evt: threading.Event | None) -> None:
 
 
 def is_valid_contact(rec: dict) -> bool:
-    """A record is considered valid if it has a phone OR an email."""
-    return bool((rec.get("phone") or "").strip() or (rec.get("email") or "").strip())
+    """A record is considered valid only when it has a phone number.
+
+    Kept in sync with `storage.is_valid_record`. Email-only records are
+    intentionally not counted toward the target — the user has explicitly
+    asked the parser to focus on companies with phone numbers.
+    """
+    return bool((rec.get("phone") or "").strip())
 
 
 def count_valid(records: Iterable[dict]) -> int:

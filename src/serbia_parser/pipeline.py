@@ -46,9 +46,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-SEARCH_WORKERS = _env_int("SERBIA_SEARCH_WORKERS", 4)
-DIRECTORY_WORKERS = _env_int("SERBIA_DIRECTORY_WORKERS", 4)
-CRAWL_WORKERS = _env_int("SERBIA_CRAWL_WORKERS", 6)
+SEARCH_WORKERS = _env_int("SERBIA_SEARCH_WORKERS", 6)
+DIRECTORY_WORKERS = _env_int("SERBIA_DIRECTORY_WORKERS", 6)
+CRAWL_WORKERS = _env_int("SERBIA_CRAWL_WORKERS", 10)
 
 log = logging.getLogger(__name__)
 

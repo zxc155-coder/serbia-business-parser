@@ -142,7 +142,21 @@ def _format_progress(job: Job) -> str:
 
 class BotApp:
     def __init__(self, token: str) -> None:
-        self.app = Application.builder().token(token).build()
+        # Generous network timeouts: the parser runs in a worker thread but
+        # still occupies the GIL during HTML parsing, which can briefly starve
+        # the asyncio loop and make Telegram long-polling time out. Bigger
+        # connect/read timeouts make those stalls invisible to the user.
+        self.app = (
+            Application.builder()
+            .token(token)
+            .connect_timeout(20.0)
+            .read_timeout(40.0)
+            .write_timeout(20.0)
+            .pool_timeout(20.0)
+            .get_updates_read_timeout(60.0)
+            .get_updates_connect_timeout(20.0)
+            .build()
+        )
         self._jobs: dict[int, Job] = {}  # user_id -> Job
         self._jobs_lock = asyncio.Lock()
         self._register_handlers()

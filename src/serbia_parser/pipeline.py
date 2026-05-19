@@ -30,12 +30,25 @@ from .sources import bing, companywall, duckduckgo, privredni_imenik
 from .sources import maps as maps_src
 from .storage import write_csv
 
-# Concurrency knobs. Conservative defaults that we have validated locally; can
-# be overridden via env vars in bot.py / cli.py for deployments with different
-# upstream tolerance.
-SEARCH_WORKERS = 8
-DIRECTORY_WORKERS = 8
-CRAWL_WORKERS = 16
+
+# Concurrency knobs. Defaults are tuned for Render's free-tier instance
+# (~0.1 vCPU shared, 512 MB RAM). With too many concurrent crawl workers the
+# GIL/asyncio loop in the bot process gets so little time that the Telegram
+# `get_updates` long-poll HTTP call times out and the bot logs a TimedOut
+# every few seconds. Override via env vars when running on a beefier host.
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        v = int(os.environ.get(name, default))
+        return max(1, v)
+    except (TypeError, ValueError):
+        return default
+
+
+SEARCH_WORKERS = _env_int("SERBIA_SEARCH_WORKERS", 4)
+DIRECTORY_WORKERS = _env_int("SERBIA_DIRECTORY_WORKERS", 4)
+CRAWL_WORKERS = _env_int("SERBIA_CRAWL_WORKERS", 6)
 
 log = logging.getLogger(__name__)
 

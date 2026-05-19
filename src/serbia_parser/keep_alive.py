@@ -28,26 +28,37 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "serbia-parser-keepalive/1.0"
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib API name
-        if self.path in ("/health", "/healthz", "/", "/ping"):
-            payload = {
-                "status": "ok",
-                "service": "serbia-business-parser-bot",
-                "uptime_s": round(time.time() - _started_at, 1),
-            }
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+        try:
+            if self.path in ("/health", "/healthz", "/", "/ping"):
+                payload = {
+                    "status": "ok",
+                    "service": "serbia-business-parser-bot",
+                    "uptime_s": round(time.time() - _started_at, 1),
+                }
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Health-check clients (Render's prober, browsers, curl) sometimes
+            # disconnect before we finish writing. That's fine and not worth
+            # the multi-line traceback BaseHTTPRequestHandler would otherwise
+            # dump on stderr.
             return
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003 — stdlib name
         log.debug("keep_alive: " + fmt, *args)
+
+    def log_error(self, fmt: str, *args) -> None:
+        # Same reason as above — keep socketserver's chatter out of the logs.
+        log.debug("keep_alive error: " + fmt, *args)
 
 
 def start(port: int | None = None) -> ThreadingHTTPServer:

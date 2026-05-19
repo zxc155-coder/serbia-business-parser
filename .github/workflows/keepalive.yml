@@ -1,0 +1,35 @@
+name: keep-alive
+
+# Pings the bot's /health endpoint every 5 minutes so the Render free dyno
+# doesn't sleep after 15 minutes of inactivity. Without this the bot stops
+# polling Telegram and looks "dead" until the next HTTP hit wakes it up.
+
+on:
+  schedule:
+    # GitHub cron resolution is 5 min; runners may delay by a few minutes
+    # under load, so 5 min is the right interval (we have a 15-minute window).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /health
+        run: |
+          set -e
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/body.txt -w "%{http_code}" \
+                   --max-time 30 \
+                   https://serbia-business-parser-bot.onrender.com/health || true)
+            echo "attempt $i → HTTP $code"
+            cat /tmp/body.txt || true
+            echo
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "health check did not return 200 after 3 tries"
+          exit 1

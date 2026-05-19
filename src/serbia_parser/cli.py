@@ -60,6 +60,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Cap on websites to crawl per category (debug/dev).",
     )
     parser.add_argument(
+        "--target-valid",
+        type=int,
+        default=None,
+        help="Stop a category once this many records with a phone or email have been collected.",
+    )
+    parser.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        help="Hard time budget (seconds) per category. The pipeline returns early once exceeded.",
+    )
+    parser.add_argument(
         "--list-categories",
         action="store_true",
         help="List available categories and exit.",
@@ -84,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
         max_maps_results=args.max_maps,
         cities=args.cities,
         max_websites=args.max_websites,
+        target_valid=args.target_valid,
+        deadline_s=args.deadline_s,
     )
 
     if args.category:

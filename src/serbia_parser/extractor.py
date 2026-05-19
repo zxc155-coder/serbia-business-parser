@@ -12,13 +12,24 @@ from bs4 import BeautifulSoup
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE)
 
 # Serbian phone numbers: +381..., 06X..., 011..., 021... etc.
+# Accept `+381`, plain `381` (some sites omit the plus), or national `0XX`
+# leading digits, followed by 6+ separated digit groups. Separators allowed:
+# space, dash, dot, slash, parens, non-breaking space.
+_SEP = r"[\s\-./()\u00a0]"
 PHONE_RE = re.compile(
-    r"(?:\+?\s*381[\s\-./()]*\d[\d\s\-./()]{6,}\d"
-    r"|0\s*\d{1,3}[\s\-./()]*\d[\d\s\-./()]{5,}\d)"
+    r"(?:(?:\+|00)?\s*381" + _SEP + r"*\d" + r"(?:" + _SEP + r"*\d){5,12}"
+    r"|0\s*\d{1,3}" + _SEP + r"*\d(?:" + _SEP + r"*\d){5,11})"
 )
 
-# Junk patterns commonly mis-matched as phone numbers.
-PHONE_BLACKLIST_RE = re.compile(r"^\D*0+\D*$|sentry|cdn|maxcdn|css|js|\.png|\.jpg", re.I)
+# `tel:` href fallback: easier pattern, just need digits with optional + prefix.
+TEL_HREF_RE = re.compile(r'href=["\']?tel:\s*\+?([\d\s\-./()\u00a0]{6,})["\']?', re.I)
+
+# Junk patterns commonly mis-matched as phone numbers (analytics ids, css hashes,
+# image filenames, etc.).
+PHONE_BLACKLIST_RE = re.compile(
+    r"^\D*0+\D*$|sentry|cdn|maxcdn|css|js|\.png|\.jpg|\.gif|\.svg|\.webp",
+    re.I,
+)
 
 # Address heuristic: tries to capture street + number + city in Latin Serbian / Cyrillic.
 ADDRESS_KEYWORDS = (
@@ -39,17 +50,26 @@ CONTACT_PATHS = (
     "/kontakt",
     "/kontakt/",
     "/kontakt.html",
+    "/kontakti",
+    "/kontakti/",
     "/kontakt-nas",
     "/kontaktirajte-nas",
+    "/kontakt-info",
+    "/контакт",
     "/contact",
     "/contact/",
     "/contact.html",
     "/contact-us",
+    "/contacts",
     "/o-nama",
+    "/o-nama/",
     "/about",
     "/about-us",
     "/impressum",
     "/imprint",
+    "/sr/kontakt",
+    "/en/contact",
+    "/en/contact-us",
 )
 
 
@@ -114,7 +134,13 @@ def extract_from_html(html: str, base_url: str | None = None) -> ContactInfo:
     info.emails = _uniq(EMAIL_RE.findall(text + " " + html))
     info.emails = [e for e in info.emails if not _looks_like_image(e)]
 
-    phones_raw = PHONE_RE.findall(text)
+    # Search BOTH visible text AND raw HTML — many sites hide phones in
+    # `data-phone` attributes or `<a href="tel:">` and the visible text only
+    # says "Позови нас" / "Call us".
+    phones_raw = list(PHONE_RE.findall(text))
+    phones_raw.extend(PHONE_RE.findall(html))
+    # Also pull from explicit `tel:` hrefs (most reliable signal).
+    phones_raw.extend(TEL_HREF_RE.findall(html))
     info.phones = _uniq([p for p in (_normalize_phone(p) for p in phones_raw) if p])
 
     addresses: list[str] = []

@@ -1,13 +1,20 @@
 """End-to-end pipeline: search → crawl → dedup → save per category.
 
-Supports progress callbacks and cancellation so it can be driven from a Telegram
-bot or any UI that wants live updates.
+Tuned for throughput: parallel keyword fan-out, parallel directory profile
+fetches, parallel website crawls, and per-host rate limiting in HTTP so that
+concurrent workers hitting different hosts do not stall each other.
+
+A category run can be capped with `target_valid` so the pipeline stops once
+enough records with a phone or email have been collected — useful when the
+caller has a "N contacts per session" goal (e.g. ~500 / 20 min from the bot).
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
+import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -23,9 +30,25 @@ from .sources import bing, companywall, duckduckgo, privredni_imenik
 from .sources import maps as maps_src
 from .storage import write_csv
 
-# Concurrency: how many websites we crawl in parallel. requests.Session is
-# thread-safe for read-only GETs with our usage, so this is fine.
-CRAWL_WORKERS = 6
+
+# Concurrency knobs. Defaults are tuned for Render's free-tier instance
+# (~0.1 vCPU shared, 512 MB RAM). With too many concurrent crawl workers the
+# GIL/asyncio loop in the bot process gets so little time that the Telegram
+# `get_updates` long-poll HTTP call times out and the bot logs a TimedOut
+# every few seconds. Override via env vars when running on a beefier host.
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        v = int(os.environ.get(name, default))
+        return max(1, v)
+    except (TypeError, ValueError):
+        return default
+
+
+SEARCH_WORKERS = _env_int("SERBIA_SEARCH_WORKERS", 6)
+DIRECTORY_WORKERS = _env_int("SERBIA_DIRECTORY_WORKERS", 6)
+CRAWL_WORKERS = _env_int("SERBIA_CRAWL_WORKERS", 10)
 
 log = logging.getLogger(__name__)
 
@@ -62,11 +85,16 @@ class Progress:
     current: int
     total: int
     found: int = 0
+    valid: int = 0
     detail: str = ""
 
 
 class Cancelled(Exception):
     """Raised when the user requested cancellation."""
+
+
+class _TargetReached(Exception):
+    """Internal marker: enough valid records collected, stop early."""
 
 
 ProgressCB = Callable[[Progress], None]
@@ -86,6 +114,20 @@ def _check_cancel(evt: threading.Event | None) -> None:
         raise Cancelled()
 
 
+def is_valid_contact(rec: dict) -> bool:
+    """A record is considered valid only when it has a phone number.
+
+    Kept in sync with `storage.is_valid_record`. Email-only records are
+    intentionally not counted toward the target — the user has explicitly
+    asked the parser to focus on companies with phone numbers.
+    """
+    return bool((rec.get("phone") or "").strip())
+
+
+def count_valid(records: Iterable[dict]) -> int:
+    return sum(1 for r in records if is_valid_contact(r))
+
+
 def run_category(
     category: Category,
     out_dir: Path,
@@ -95,6 +137,8 @@ def run_category(
     max_maps_results: int = 20,
     cities: Iterable[str] = SERBIAN_CITIES,
     max_websites: int | None = None,
+    target_valid: int | None = None,
+    deadline_s: float | None = None,
     on_progress: ProgressCB | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
@@ -105,69 +149,143 @@ def run_category(
         out_path.unlink()
 
     log.info("=== %s (%s) ===", category.key, category.title_sr)
+    started = time.monotonic()
 
-    # --- 1. Search-engine fan-out → candidate websites. ----------------------
+    def _time_left() -> float | None:
+        if deadline_s is None:
+            return None
+        return deadline_s - (time.monotonic() - started)
+
+    def _out_of_time() -> bool:
+        left = _time_left()
+        return left is not None and left <= 0
+
+    records: list[dict] = []
+    valid_lock = threading.Lock()
+
+    def _add_record(rec: dict | None) -> None:
+        if rec is None:
+            return
+        with valid_lock:
+            records.append(rec)
+
+    def _enough() -> bool:
+        if target_valid is None:
+            return False
+        with valid_lock:
+            return count_valid(records) >= target_valid
+
+    # --- 1. Search-engine fan-out → candidate websites (parallel). ---------
     keywords = (*category.keywords_sr, *category.keywords_en)
     search_hits: list[dict[str, str]] = []
-    for i, kw in enumerate(keywords, 1):
-        _check_cancel(cancel_event)
-        _emit(
-            on_progress,
-            Progress(category.key, "search", i, len(keywords), len(search_hits), kw),
-        )
+    search_lock = threading.Lock()
+
+    def _search_one(kw: str) -> int:
+        local: list[dict[str, str]] = []
         try:
-            search_hits.extend(duckduckgo.search(http, kw, max_results=max_search_results))
+            local.extend(duckduckgo.search(http, kw, max_results=max_search_results))
         except Exception as e:
             log.warning("DDG error for %r: %s", kw, e)
         try:
-            search_hits.extend(bing.search(http, kw, max_results=max_search_results))
+            local.extend(bing.search(http, kw, max_results=max_search_results))
         except Exception as e:
             log.warning("Bing error for %r: %s", kw, e)
+        with search_lock:
+            search_hits.extend(local)
+        return len(local)
+
+    done_search = 0
+    total_search = len(keywords)
+    with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as ex:
+        futs = {ex.submit(_search_one, kw): kw for kw in keywords}
+        try:
+            for fut in as_completed(futs):
+                _check_cancel(cancel_event)
+                done_search += 1
+                _emit(
+                    on_progress,
+                    Progress(
+                        category.key,
+                        "search",
+                        done_search,
+                        total_search,
+                        len(search_hits),
+                        0,
+                        futs[fut],
+                    ),
+                )
+                if _out_of_time():
+                    log.info("search: out of time after %s/%s keywords", done_search, total_search)
+                    break
+        except Cancelled:
+            for f in futs:
+                f.cancel()
+            raise
     log.info("search hits: %s", len(search_hits))
 
-    # --- 2. Directory lookups (companywall.rs + privredni-imenik.com). ------
+    # --- 2. Directory lookups (companywall + privredni-imenik) -- parallel. -
+    # Use ALL SR keywords — directories are by far the highest-yield source for
+    # contacts with phones, so we cast a wide net. CW has no phone so we only
+    # run it on a slice; PI gets the full keyword list to maximise phone yield.
+    dir_keywords_pi = list(category.keywords_sr)
+    dir_keywords_cw = list(category.keywords_sr[:4])
     cw_hits: list[dict[str, str]] = []
     pi_hits: list[dict[str, str]] = []
-    # Keep first few SR keywords (most relevant) for directory searches.
-    dir_keywords = list(category.keywords_sr[:4])
-    total_dir_steps = len(dir_keywords) * 2  # 2 directories
-    step = 0
-    for kw in dir_keywords:
-        _check_cancel(cancel_event)
-        step += 1
-        _emit(
-            on_progress,
-            Progress(
-                category.key,
-                "directory",
-                step,
-                total_dir_steps,
-                len(cw_hits) + len(pi_hits),
-                f"companywall: {kw}",
-            ),
-        )
+    cw_lock = threading.Lock()
+    pi_lock = threading.Lock()
+
+    def _cw_search(kw: str) -> None:
         try:
-            cw_hits.extend(companywall.search(http, kw, max_results=20))
+            local = companywall.search(http, kw, max_results=20)
         except Exception as e:
             log.warning("companywall search error for %r: %s", kw, e)
+            return
+        with cw_lock:
+            cw_hits.extend(local)
 
-        _check_cancel(cancel_event)
-        step += 1
-        _emit(
-            on_progress,
-            Progress(
-                category.key,
-                "directory",
-                step,
-                total_dir_steps,
-                len(cw_hits) + len(pi_hits),
-                f"privredni-imenik: {kw}",
-            ),
-        )
+    def _pi_search(kw: str) -> None:
         try:
-            pi_hits.extend(privredni_imenik.search(http, kw, max_results=40))
+            local = privredni_imenik.search(http, kw, max_results=60)
         except Exception as e:
             log.warning("privredni_imenik search error for %r: %s", kw, e)
+            return
+        with pi_lock:
+            pi_hits.extend(local)
+
+    dir_tasks: list[tuple[str, Callable[[str], None]]] = []
+    for kw in dir_keywords_cw:
+        dir_tasks.append((f"companywall: {kw}", lambda k=kw: _cw_search(k)))
+    for kw in dir_keywords_pi:
+        dir_tasks.append((f"privredni-imenik: {kw}", lambda k=kw: _pi_search(k)))
+
+    done_dir = 0
+    total_dir = len(dir_tasks)
+    with ThreadPoolExecutor(max_workers=DIRECTORY_WORKERS) as ex:
+        futs2 = {ex.submit(fn): label for label, fn in dir_tasks}
+        try:
+            for fut in as_completed(futs2):
+                _check_cancel(cancel_event)
+                done_dir += 1
+                _emit(
+                    on_progress,
+                    Progress(
+                        category.key,
+                        "directory",
+                        done_dir,
+                        total_dir,
+                        len(cw_hits) + len(pi_hits),
+                        0,
+                        futs2[fut],
+                    ),
+                )
+                if _out_of_time():
+                    log.info("dir search: out of time")
+                    break
+        except Cancelled:
+            for f in futs2:
+                f.cancel()
+            raise
+
     # Deduplicate directory hits by url.
     cw_seen: set[str] = set()
     cw_hits = [h for h in cw_hits if h["url"] not in cw_seen and not cw_seen.add(h["url"])]
@@ -175,16 +293,306 @@ def run_category(
     pi_hits = [h for h in pi_hits if h["url"] not in pi_seen and not pi_seen.add(h["url"])]
     log.info("companywall hits: %s, privredni_imenik hits: %s", len(cw_hits), len(pi_hits))
 
-    # --- 3. Maps lookups (city × category query). ---------------------------
-    maps_hits: list[dict[str, str]] = []
-    if use_maps:
+    # --- 3. Directory profiles -- parallel, yield highest-quality contacts. -
+    # We do these BEFORE Maps and BEFORE the website crawl because they are by
+    # far the cheapest per valid contact (one HTTP request → name + phone +
+    # email + address + activity) and let us short-circuit early if we hit
+    # the target.
+
+    def _pi_one(pi: dict[str, str]) -> dict | None:
+        try:
+            profile = privredni_imenik.fetch_profile(http, pi["url"])
+        except Exception as e:
+            log.warning("privredni_imenik profile error for %s: %s", pi["url"], e)
+            return None
+        if not profile and not pi.get("title"):
+            return None
+        address = profile.get("address", "")
+        company = profile.get("name") or pi.get("title", "")
+        return {
+            "category": category.title_ru,
+            "company": company,
+            "website": profile.get("website", ""),
+            "phone": profile.get("phone", ""),
+            "email": profile.get("email", ""),
+            "address": address,
+            "city": _guess_city([address] if address else []),
+            "social": "",
+            "description": profile.get("activity", ""),
+            "source": "privredni_imenik",
+            "source_url": pi["url"],
+        }
+
+    def _cw_one(cw: dict[str, str]) -> dict | None:
+        try:
+            profile = companywall.fetch_profile(http, cw["url"])
+        except Exception as e:
+            log.warning("companywall profile error for %s: %s", cw["url"], e)
+            return None
+        if not profile and not cw.get("title"):
+            return None
+        address = profile.get("address", "")
+        return {
+            "category": category.title_ru,
+            "company": cw["title"],
+            "website": profile.get("website", ""),
+            "phone": profile.get("phone", ""),
+            "email": profile.get("email", ""),
+            "address": address,
+            "city": profile.get("city", "") or _guess_city([address] if address else []),
+            "social": "",
+            "description": profile.get("activity", ""),
+            "source": "companywall",
+            "source_url": cw["url"],
+        }
+
+    # Privredni-imenik first — highest yield of valid contacts per request.
+    if pi_hits and not _out_of_time():
+        done = 0
+        total = len(pi_hits)
+        with ThreadPoolExecutor(max_workers=DIRECTORY_WORKERS) as ex:
+            futures = {ex.submit(_pi_one, pi): pi for pi in pi_hits}
+            try:
+                for fut in as_completed(futures):
+                    _check_cancel(cancel_event)
+                    done += 1
+                    rec = fut.result()
+                    _add_record(rec)
+                    _emit(
+                        on_progress,
+                        Progress(
+                            category.key,
+                            "directory",
+                            done,
+                            total,
+                            len(records),
+                            count_valid(records),
+                            futures[fut].get("title", ""),
+                        ),
+                    )
+                    if _enough() or _out_of_time():
+                        for f in futures:
+                            f.cancel()
+                        break
+            except Cancelled:
+                for f in futures:
+                    f.cancel()
+                raise
+
+    if cw_hits and not _enough() and not _out_of_time():
+        done = 0
+        total = len(cw_hits)
+        with ThreadPoolExecutor(max_workers=DIRECTORY_WORKERS) as ex:
+            futures = {ex.submit(_cw_one, cw): cw for cw in cw_hits}
+            try:
+                for fut in as_completed(futures):
+                    _check_cancel(cancel_event)
+                    done += 1
+                    rec = fut.result()
+                    _add_record(rec)
+                    _emit(
+                        on_progress,
+                        Progress(
+                            category.key,
+                            "directory",
+                            done,
+                            total,
+                            len(records),
+                            count_valid(records),
+                            futures[fut].get("title", ""),
+                        ),
+                    )
+                    if _enough() or _out_of_time():
+                        for f in futures:
+                            f.cancel()
+                        break
+            except Cancelled:
+                for f in futures:
+                    f.cancel()
+                raise
+
+    # --- 3b. Enrich directory records missing a phone by crawling their site.
+    # Directory listings (privredni-imenik especially) often expose the
+    # company website but not the phone. Crawling that website is by far
+    # the cheapest way to fill in the phone we're optimising the run for.
+    if not _enough() and not _out_of_time():
+        enrich_targets: list[dict] = []
+        for rec in records:
+            if (rec.get("phone") or "").strip():
+                continue
+            website = (rec.get("website") or "").strip()
+            if not website:
+                continue
+            dom = base_domain(website)
+            if not dom or dom in DOMAIN_BLACKLIST:
+                continue
+            enrich_targets.append(rec)
+
+        if enrich_targets:
+            log.info("enriching %s phoneless directory records via website crawl", len(enrich_targets))
+
+            def _enrich_one(rec: dict) -> None:
+                homepage = _homepage(rec.get("website") or "")
+                try:
+                    info = crawl_site(http, homepage)
+                except Exception as e:
+                    log.warning("enrich crawl failed for %s: %s", homepage, e)
+                    return
+                if not info.phones and not info.emails:
+                    return
+                # Only fill in fields we don't already have.
+                if info.phones and not (rec.get("phone") or "").strip():
+                    rec["phone"] = "; ".join(info.phones[:3])
+                if info.emails and not (rec.get("email") or "").strip():
+                    rec["email"] = "; ".join(info.emails[:3])
+
+            done = 0
+            total = len(enrich_targets)
+            with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+                futures = {ex.submit(_enrich_one, rec): rec for rec in enrich_targets}
+                try:
+                    for fut in as_completed(futures):
+                        _check_cancel(cancel_event)
+                        done += 1
+                        _ = fut.result()
+                        _emit(
+                            on_progress,
+                            Progress(
+                                category.key,
+                                "crawl",
+                                done,
+                                total,
+                                len(records),
+                                count_valid(records),
+                                futures[fut].get("company", ""),
+                            ),
+                        )
+                        if _enough() or _out_of_time():
+                            for f in futures:
+                                f.cancel()
+                            break
+                except Cancelled:
+                    for f in futures:
+                        f.cancel()
+                    raise
+
+    # --- 4. Website crawl on search-engine hits -----------------------------
+    if not _enough() and not _out_of_time():
+        seen_domains: set[str] = set()
+        # Skip domains we already have a phone for; for the rest the crawl will
+        # produce a fresh record that dedup merges into the existing one.
+        for rec in records:
+            if not (rec.get("phone") or "").strip():
+                continue
+            d = base_domain(rec.get("website") or "")
+            if d:
+                seen_domains.add(d)
+
+        websites_to_crawl: list[tuple[str, dict]] = []
+        for hit in search_hits:
+            url = hit.get("url", "")
+            domain = base_domain(url)
+            if not domain or domain in DOMAIN_BLACKLIST:
+                continue
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            homepage = _homepage(url)
+            websites_to_crawl.append((homepage, hit))
+            if max_websites and len(websites_to_crawl) >= max_websites:
+                break
+
+        log.info("crawling %s unique websites in parallel", len(websites_to_crawl))
+
+        def _crawl_one(args: tuple[str, dict]) -> dict | None:
+            homepage, hit = args
+            try:
+                info = crawl_site(http, homepage)
+            except Exception as e:
+                log.warning("crawl failed for %s: %s", homepage, e)
+                return None
+            if not info.is_useful():
+                return None
+            return {
+                "category": category.title_ru,
+                "company": info.title or hit.get("title", "")[:200],
+                "website": homepage,
+                "phone": "; ".join(info.phones[:3]),
+                "email": "; ".join(info.emails[:3]),
+                "address": info.addresses[0] if info.addresses else "",
+                "city": _guess_city(info.addresses),
+                "social": "; ".join(info.socials[:5]),
+                "description": info.description or hit.get("snippet", ""),
+                "source": hit["source"],
+                "source_url": hit["url"],
+            }
+
+        if websites_to_crawl:
+            done = 0
+            total = len(websites_to_crawl)
+            with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+                futures = {ex.submit(_crawl_one, args): args for args in websites_to_crawl}
+                try:
+                    for fut in as_completed(futures):
+                        _check_cancel(cancel_event)
+                        done += 1
+                        args = futures[fut]
+                        rec = fut.result()
+                        _add_record(rec)
+                        _emit(
+                            on_progress,
+                            Progress(
+                                category.key,
+                                "crawl",
+                                done,
+                                total,
+                                len(records),
+                                count_valid(records),
+                                args[0],
+                            ),
+                        )
+                        if _enough() or _out_of_time():
+                            for f in futures:
+                                f.cancel()
+                            break
+                except Cancelled:
+                    for f in futures:
+                        f.cancel()
+                    raise
+
+    # --- 5. Maps lookups (city × category query) -- only if requested AND we
+    #         still need more contacts AND time allows.
+    if use_maps and not _enough() and not _out_of_time():
         city_list = list(cities)
         total_maps = len(category.maps_queries) * len(city_list)
         step = 0
+        stop = False
         for q in category.maps_queries:
+            if stop:
+                break
             for city in city_list:
                 _check_cancel(cancel_event)
                 step += 1
+                try:
+                    rows = maps_src.search_places(q, city, max_results=max_maps_results)
+                except Exception as e:
+                    log.warning("Maps error for %s / %s: %s", q, city, e)
+                    rows = []
+                for mh in rows:
+                    rec = {
+                        "category": category.title_ru,
+                        "company": mh.get("name") or mh.get("title", ""),
+                        "website": mh.get("website", ""),
+                        "phone": mh.get("phone", ""),
+                        "email": "",
+                        "address": mh.get("address", ""),
+                        "city": _guess_city([mh.get("address", "")]),
+                        "social": "",
+                        "description": "",
+                        "source": "google_maps",
+                        "source_url": mh.get("place_url", ""),
+                    }
+                    _add_record(rec)
                 _emit(
                     on_progress,
                     Progress(
@@ -192,213 +600,23 @@ def run_category(
                         "maps",
                         step,
                         total_maps,
-                        len(maps_hits),
+                        len(records),
+                        count_valid(records),
                         f"{q} / {city}",
                     ),
                 )
-                try:
-                    maps_hits.extend(maps_src.search_places(q, city, max_results=max_maps_results))
-                except Exception as e:
-                    log.warning("Maps error for %s / %s: %s", q, city, e)
-    log.info("maps hits: %s", len(maps_hits))
+                if _enough() or _out_of_time():
+                    stop = True
+                    break
 
-    # --- 4. Convert hits into business records. -----------------------------
-    records: list[dict] = []
-
-    seen_domains: set[str] = set()
-    websites_to_crawl: list[tuple[str, dict]] = []
-    for hit in search_hits:
-        url = hit.get("url", "")
-        domain = base_domain(url)
-        if not domain or domain in DOMAIN_BLACKLIST:
-            continue
-        if domain in seen_domains:
-            continue
-        seen_domains.add(domain)
-        homepage = _homepage(url)
-        websites_to_crawl.append((homepage, hit))
-        if max_websites and len(websites_to_crawl) >= max_websites:
-            break
-
-    log.info("crawling %s unique websites in parallel", len(websites_to_crawl))
-
-    def _crawl_one(args: tuple[str, dict]) -> dict | None:
-        homepage, hit = args
-        try:
-            info = crawl_site(http, homepage)
-        except Exception as e:  # crawler must never crash the executor
-            log.warning("crawl failed for %s: %s", homepage, e)
-            return None
-        if not info.is_useful():
-            return None
-        return {
-            "category": category.title_ru,
-            "company": info.title or hit.get("title", "")[:200],
-            "website": homepage,
-            "phone": "; ".join(info.phones[:3]),
-            "email": "; ".join(info.emails[:3]),
-            "address": info.addresses[0] if info.addresses else "",
-            "city": _guess_city(info.addresses),
-            "social": "; ".join(info.socials[:5]),
-            "description": info.description or hit.get("snippet", ""),
-            "source": hit["source"],
-            "source_url": hit["url"],
-        }
-
-    if websites_to_crawl:
-        done = 0
-        total = len(websites_to_crawl)
-        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
-            futures = {ex.submit(_crawl_one, args): args for args in websites_to_crawl}
-            try:
-                for fut in as_completed(futures):
-                    _check_cancel(cancel_event)
-                    done += 1
-                    args = futures[fut]
-                    rec = fut.result()
-                    if rec is not None:
-                        records.append(rec)
-                    _emit(
-                        on_progress,
-                        Progress(category.key, "crawl", done, total, len(records), args[0]),
-                    )
-            except Cancelled:
-                for f in futures:
-                    f.cancel()
-                raise
-
-    # companywall.rs profiles -- fetch in parallel and emit progress per result.
-    if cw_hits:
-        done = 0
-        total = len(cw_hits)
-
-        def _cw_one(cw: dict[str, str]) -> dict | None:
-            try:
-                profile = companywall.fetch_profile(http, cw["url"])
-            except Exception as e:
-                log.warning("companywall profile error for %s: %s", cw["url"], e)
-                return None
-            if not profile and not cw.get("title"):
-                return None
-            address = profile.get("address", "")
-            return {
-                "category": category.title_ru,
-                "company": cw["title"],
-                "website": profile.get("website", ""),
-                "phone": profile.get("phone", ""),
-                "email": profile.get("email", ""),
-                "address": address,
-                "city": profile.get("city", "") or _guess_city([address] if address else []),
-                "social": "",
-                "description": profile.get("activity", ""),
-                "source": "companywall",
-                "source_url": cw["url"],
-            }
-
-        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
-            futures = {ex.submit(_cw_one, cw): cw for cw in cw_hits}
-            try:
-                for fut in as_completed(futures):
-                    _check_cancel(cancel_event)
-                    done += 1
-                    rec = fut.result()
-                    if rec is not None:
-                        records.append(rec)
-                    _emit(
-                        on_progress,
-                        Progress(
-                            category.key,
-                            "directory",
-                            done,
-                            total,
-                            len(records),
-                            futures[fut].get("title", ""),
-                        ),
-                    )
-            except Cancelled:
-                for f in futures:
-                    f.cancel()
-                raise
-
-    # privredni-imenik.com profiles -- fetch in parallel.
-    if pi_hits:
-        done = 0
-        total = len(pi_hits)
-
-        def _pi_one(pi: dict[str, str]) -> dict | None:
-            try:
-                profile = privredni_imenik.fetch_profile(http, pi["url"])
-            except Exception as e:
-                log.warning("privredni_imenik profile error for %s: %s", pi["url"], e)
-                return None
-            if not profile and not pi.get("title"):
-                return None
-            address = profile.get("address", "")
-            company = profile.get("name") or pi.get("title", "")
-            return {
-                "category": category.title_ru,
-                "company": company,
-                "website": profile.get("website", ""),
-                "phone": profile.get("phone", ""),
-                "email": profile.get("email", ""),
-                "address": address,
-                "city": _guess_city([address] if address else []),
-                "social": "",
-                "description": profile.get("activity", ""),
-                "source": "privredni_imenik",
-                "source_url": pi["url"],
-            }
-
-        with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
-            futures = {ex.submit(_pi_one, pi): pi for pi in pi_hits}
-            try:
-                for fut in as_completed(futures):
-                    _check_cancel(cancel_event)
-                    done += 1
-                    rec = fut.result()
-                    if rec is not None:
-                        records.append(rec)
-                    _emit(
-                        on_progress,
-                        Progress(
-                            category.key,
-                            "directory",
-                            done,
-                            total,
-                            len(records),
-                            futures[fut].get("title", ""),
-                        ),
-                    )
-            except Cancelled:
-                for f in futures:
-                    f.cancel()
-                raise
-
-    for mh in maps_hits:
-        website = mh.get("website", "")
-        records.append(
-            {
-                "category": category.title_ru,
-                "company": mh.get("name") or mh.get("title", ""),
-                "website": website,
-                "phone": mh.get("phone", ""),
-                "email": "",
-                "address": mh.get("address", ""),
-                "city": _guess_city([mh.get("address", "")]),
-                "social": "",
-                "description": "",
-                "source": "google_maps",
-                "source_url": mh.get("place_url", ""),
-            }
-        )
-
-    # --- 5. Dedup + write. --------------------------------------------------
+    # --- 6. Dedup + write. --------------------------------------------------
     merged = dedup_records(records)
     written = write_csv(out_path, merged)
-    log.info("wrote %s rows → %s", written, out_path)
+    valid = count_valid(merged)
+    log.info("wrote %s rows (%s valid) → %s", written, valid, out_path)
     _emit(
         on_progress,
-        Progress(category.key, "done", 1, 1, written, str(out_path)),
+        Progress(category.key, "done", 1, 1, written, valid, str(out_path)),
     )
     return out_path
 
@@ -414,13 +632,16 @@ def _homepage(url: str) -> str:
     return f"{p.scheme or 'https'}://{p.netloc}/"
 
 
+_CITY_RE = re.compile("|".join(re.escape(c) for c in SERBIAN_CITIES), re.IGNORECASE)
+
+
 def _guess_city(addresses: Iterable[str]) -> str:
     for addr in addresses:
         if not addr:
             continue
-        for city in SERBIAN_CITIES:
-            if city.lower() in addr.lower():
-                return city
+        m = _CITY_RE.search(addr)
+        if m:
+            return m.group(0)
     return ""
 
 
@@ -430,6 +651,8 @@ __all__ = [
     "Progress",
     "ProgressCB",
     "by_key",
+    "count_valid",
+    "is_valid_contact",
     "run_all",
     "run_category",
 ]

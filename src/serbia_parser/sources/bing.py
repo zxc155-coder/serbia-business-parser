@@ -15,7 +15,9 @@ log = logging.getLogger(__name__)
 def search(http: HTTP, query: str, max_results: int = 25) -> list[dict[str, str]]:
     results: list[dict[str, str]] = []
     seen: set[str] = set()
-    for first in (1, 11, 21):
+    # Bing tends to gate aggressive pagination behind captchas; two pages is a
+    # good balance between coverage and speed.
+    for first in (1, 11):
         resp = http.get(
             "https://www.bing.com/search",
             params={"q": query, "first": str(first), "setlang": "sr"},

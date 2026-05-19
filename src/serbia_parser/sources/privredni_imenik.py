@@ -60,26 +60,36 @@ def search(http: HTTP, query: str, max_results: int = 40) -> list[dict[str, str]
     return out
 
 
-# Map label text (with trailing colon stripped) → record key.
+# Map normalized label text (lowercase, no trailing colon) → record key.
+# Keys are matched case-insensitively.
 _LABELS: dict[str, str] = {
-    "Naziv": "name",
-    "Sajt": "website",
-    "Web": "website",
-    "Email": "email",
-    "E-mail": "email",
-    "Telefon": "phone",
-    "Telefoni": "phone",
-    "Mob": "phone",
-    "Mobilni": "phone",
-    "Faks": "fax",
-    "Adresa": "address",
-    "Mesto": "city",
-    "PIB": "pib",
-    "Matični broj": "registration_id",
-    "Maticni broj": "registration_id",
-    "Delatnost": "activity",
-    "Direktor": "owner",
+    "naziv": "name",
+    "sajt": "website",
+    "web": "website",
+    "email": "email",
+    "e-mail": "email",
+    "telefon": "phone",
+    "telefoni": "phone",
+    "mob": "phone",
+    "mobilni": "phone",
+    "telefaks": "fax",
+    "faks": "fax",
+    "adresa": "address",
+    "mesto": "city",
+    "pib": "pib",
+    "matični broj": "registration_id",
+    "maticni broj": "registration_id",
+    "delatnost": "activity",
+    "direktor": "owner",
 }
+
+_LABEL_NORMS = set(_LABELS.keys())
+
+
+def _label_key(text: str) -> str | None:
+    """Return the record key for a label cell, or None."""
+    norm = (text or "").strip().rstrip(":").lower()
+    return _LABELS.get(norm)
 
 
 def fetch_profile(http: HTTP, profile_url: str) -> dict[str, str]:
@@ -92,40 +102,54 @@ def fetch_profile(http: HTTP, profile_url: str) -> dict[str, str]:
         tag.decompose()
 
     data: dict[str, str] = {}
+    # Phones / fax can repeat; collect all of them, dedup, join later.
+    extras: dict[str, list[str]] = {"phone": [], "fax": []}
 
-    # Pattern A: label_text followed by an adjacent value element.
-    for node in soup.find_all(string=True):
-        txt = (node or "").strip().rstrip(":")
-        if txt not in _LABELS:
+    # privredni-imenik mixes two row layouts inside the same .row container:
+    #   Pattern A: <div col-md-4>label:</div><div col-md-8>value</div>
+    #   Pattern B: <div col-md-4>value</div><div col-md-8>LABEL</div>   (TELEFON/TELEFAKS)
+    # So for every <div> we treat its text as a possible label and look at
+    # both the next AND the previous sibling for the value.
+    for div in soup.find_all("div"):
+        # Only consider "cell"-like divs, not big containers.
+        cell_text = div.get_text(" ", strip=True)
+        if not cell_text or len(cell_text) > 30:
             continue
-        key = _LABELS[txt]
-        if key in data:
+        key = _label_key(cell_text)
+        if key is None:
             continue
-        parent = node.parent
-        if parent is None:
-            continue
-        # Look at parent's next sibling, then at parent's parent's next sibling.
-        candidates = []
-        for el in (parent.find_next_sibling(), parent.parent.find_next_sibling() if parent.parent else None):
-            if el is not None:
-                candidates.append(el)
-        for cand in candidates:
-            value = cand.get_text(" ", strip=True)
-            if value:
+        for sibling in (div.find_next_sibling(), div.find_previous_sibling()):
+            if sibling is None:
+                continue
+            value = sibling.get_text(" ", strip=True)
+            if not value or _label_key(value) is not None:
+                continue
+            if key in extras:
+                if value not in extras[key]:
+                    extras[key].append(value)
+            elif key not in data:
                 data[key] = value
-                break
+            break
 
-    # Pattern B: explicit mailto: / tel: anchors.
+    # Multi-valued fields: phone/fax.
+    if extras["phone"]:
+        data["phone"] = "; ".join(extras["phone"][:3])
+    if extras["fax"] and "fax" not in data:
+        data["fax"] = "; ".join(extras["fax"][:3])
+
+    # mailto: anchor fallback.
     if "email" not in data:
         a = soup.select_one("a[href^=mailto]")
         if a:
             data["email"] = a["href"].removeprefix("mailto:").split("?")[0].strip()
+    # tel: anchor fallback.
     if "phone" not in data:
-        a = soup.select_one("a[href^=tel]")
-        if a:
-            data["phone"] = a["href"].removeprefix("tel:").strip()
+        tels = [a["href"].removeprefix("tel:").strip() for a in soup.select("a[href^=tel]")]
+        tels = [t for t in tels if t]
+        if tels:
+            data["phone"] = "; ".join(dict.fromkeys(tels[:3]))
 
-    # Pattern C: name from <h1>.
+    # Name from <h1>.
     if "name" not in data:
         h1 = soup.select_one("h1")
         if h1:

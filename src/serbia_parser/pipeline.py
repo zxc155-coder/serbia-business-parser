@@ -211,9 +211,11 @@ def run_category(
     log.info("search hits: %s", len(search_hits))
 
     # --- 2. Directory lookups (companywall + privredni-imenik) -- parallel. -
-    # Use more SR keywords than before — directories are the highest-yield
-    # source for valid (phone+email) contacts, so we lean on them harder.
-    dir_keywords = list(category.keywords_sr[:8])
+    # Use ALL SR keywords — directories are by far the highest-yield source for
+    # contacts with phones, so we cast a wide net. CW has no phone so we only
+    # run it on a slice; PI gets the full keyword list to maximise phone yield.
+    dir_keywords_pi = list(category.keywords_sr)
+    dir_keywords_cw = list(category.keywords_sr[:4])
     cw_hits: list[dict[str, str]] = []
     pi_hits: list[dict[str, str]] = []
     cw_lock = threading.Lock()
@@ -238,8 +240,9 @@ def run_category(
             pi_hits.extend(local)
 
     dir_tasks: list[tuple[str, Callable[[str], None]]] = []
-    for kw in dir_keywords:
+    for kw in dir_keywords_cw:
         dir_tasks.append((f"companywall: {kw}", lambda k=kw: _cw_search(k)))
+    for kw in dir_keywords_pi:
         dir_tasks.append((f"privredni-imenik: {kw}", lambda k=kw: _pi_search(k)))
 
     done_dir = 0
@@ -395,11 +398,79 @@ def run_category(
                     f.cancel()
                 raise
 
+    # --- 3b. Enrich directory records missing a phone by crawling their site.
+    # Directory listings (privredni-imenik especially) often expose the
+    # company website but not the phone. Crawling that website is by far
+    # the cheapest way to fill in the phone we're optimising the run for.
+    if not _enough() and not _out_of_time():
+        enrich_targets: list[dict] = []
+        for rec in records:
+            if (rec.get("phone") or "").strip():
+                continue
+            website = (rec.get("website") or "").strip()
+            if not website:
+                continue
+            dom = base_domain(website)
+            if not dom or dom in DOMAIN_BLACKLIST:
+                continue
+            enrich_targets.append(rec)
+
+        if enrich_targets:
+            log.info("enriching %s phoneless directory records via website crawl", len(enrich_targets))
+
+            def _enrich_one(rec: dict) -> None:
+                homepage = _homepage(rec.get("website") or "")
+                try:
+                    info = crawl_site(http, homepage)
+                except Exception as e:
+                    log.warning("enrich crawl failed for %s: %s", homepage, e)
+                    return
+                if not info.phones and not info.emails:
+                    return
+                # Only fill in fields we don't already have.
+                if info.phones and not (rec.get("phone") or "").strip():
+                    rec["phone"] = "; ".join(info.phones[:3])
+                if info.emails and not (rec.get("email") or "").strip():
+                    rec["email"] = "; ".join(info.emails[:3])
+
+            done = 0
+            total = len(enrich_targets)
+            with ThreadPoolExecutor(max_workers=CRAWL_WORKERS) as ex:
+                futures = {ex.submit(_enrich_one, rec): rec for rec in enrich_targets}
+                try:
+                    for fut in as_completed(futures):
+                        _check_cancel(cancel_event)
+                        done += 1
+                        _ = fut.result()
+                        _emit(
+                            on_progress,
+                            Progress(
+                                category.key,
+                                "crawl",
+                                done,
+                                total,
+                                len(records),
+                                count_valid(records),
+                                futures[fut].get("company", ""),
+                            ),
+                        )
+                        if _enough() or _out_of_time():
+                            for f in futures:
+                                f.cancel()
+                            break
+                except Cancelled:
+                    for f in futures:
+                        f.cancel()
+                    raise
+
     # --- 4. Website crawl on search-engine hits -----------------------------
     if not _enough() and not _out_of_time():
         seen_domains: set[str] = set()
-        # If we already pulled websites from directory profiles, skip those domains.
+        # Skip domains we already have a phone for; for the rest the crawl will
+        # produce a fresh record that dedup merges into the existing one.
         for rec in records:
+            if not (rec.get("phone") or "").strip():
+                continue
             d = base_domain(rec.get("website") or "")
             if d:
                 seen_domains.add(d)
